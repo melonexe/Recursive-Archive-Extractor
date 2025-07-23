@@ -1,0 +1,23 @@
+# Requirements for building the executable
+# Core dependencies (these are included with Python standard library)
+# - tkinter (GUI framework)
+# - zipfile (zip file handling)
+# - tarfile (tar file handling) 
+# - gzip (gzip file handling)
+# - pathlib (path handling)
+# - threading (multi-threading)
+# - queue (thread communication)
+# - logging (logging system)
+# - argparse (command line parsing)
+# - datetime (date/time handling)
+# - shutil (file operations)
+
+# Build tool dependency
+pyinstaller==6.3.0
+
+# Optional: For better GUI appearance on Windows
+# These are typically included with Windows Python installations
+# - tkinter.ttk (themed widgets)
+# - tkinter.filedialog (file dialogs)
+# - tkinter.messagebox (message boxes)
+# - tkinter.scrolledtext (scrolled text widget)
