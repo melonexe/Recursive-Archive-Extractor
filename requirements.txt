@@ -1,12 +1,1 @@
-# Recursive Zip Extractor
-
-No external dependencies required - uses only Python standard library modules:
-- zipfile
-- pathlib
-- argparse
-- logging
-- os
-- typing
-
-## Python Version
-Requires Python 3.6 or higher (for pathlib and type hints support)
+PyQt6>=6.4.0
