@@ -27,7 +27,7 @@ from PyQt6.QtWidgets import (
     QTextEdit, QProgressBar, QStatusBar, QFileDialog, QMessageBox,
     QGroupBox, QSplitter
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
 from PyQt6.QtGui import QFont
 
 
@@ -298,30 +298,75 @@ class ExtractionWorker(QThread):
         self.log_level = log_level
         self.cleanup_zips = cleanup_zips
         self.show_stats = show_stats
+        self.extractor = None
+        self.log_handler = None
         
     def run(self):
         try:
-            extractor = ArchiveExtractor(
+            self.extractor = ArchiveExtractor(
                 log_level=self.log_level,
                 cleanup_zips=self.cleanup_zips
             )
             
-            log_handler = LogHandler(self.log_message)
-            log_handler.setFormatter(
+            self.log_handler = LogHandler(self.log_message)
+            self.log_handler.setFormatter(
                 logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
             )
-            extractor.logger.addHandler(log_handler)
+            self.extractor.logger.addHandler(self.log_handler)
             
-            success = extractor.recursive_unzip(self.archive_path, self.output_dir)
+            success = self.extractor.recursive_unzip(self.archive_path, self.output_dir)
             
             result_data = {'archive_path': self.archive_path}
             if self.show_stats:
-                result_data['stats'] = extractor.get_stats()
+                result_data['stats'] = self.extractor.get_stats()
             
             self.finished.emit(success, result_data)
             
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if self.log_handler and self.extractor:
+                self.extractor.logger.removeHandler(self.log_handler)
+                self.log_handler = None
+                self.extractor = None
+
+
+class BulkExtractionWorker(QThread):
+    log_message = pyqtSignal(str)
+    progress = pyqtSignal(int, int)  # current, total
+    finished = pyqtSignal(list, list)  # stats_list, files
+
+    def __init__(self, files, log_level, cleanup_zips):
+        super().__init__()
+        self.files = files
+        self.log_level = log_level
+        self.cleanup_zips = cleanup_zips
+
+    def run(self):
+        log_lines = []
+        stats_list = []
+        total = len(self.files)
+        for idx, file_path in enumerate(self.files, 1):
+            archive_path = Path(file_path)
+            output_dir = archive_path.parent / archive_path.stem
+            msg = f"\n=== [{idx}/{total}] Extracting: {archive_path.name} ==="
+            self.log_message.emit(msg)
+            extractor = ArchiveExtractor(
+                log_level=self.log_level,
+                cleanup_zips=self.cleanup_zips
+            )
+            class BulkLogHandler(logging.Handler):
+                def emit(inner_self, record):
+                    self.log_message.emit(inner_self.format(record))
+            handler = BulkLogHandler()
+            handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+            extractor.logger.addHandler(handler)
+            success = extractor.recursive_unzip(archive_path, output_dir)
+            if success:
+                stats_list.append(extractor.get_stats())
+            extractor.logger.removeHandler(handler)
+            self.progress.emit(idx, total)
+        self.finished.emit(stats_list, self.files)
 
 
 class RecursiveArchiveExtractorGUI(QMainWindow):
@@ -330,7 +375,9 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
     def __init__(self):
         super().__init__()
         self.extraction_worker = None
+        self.bulk_worker = None
         self.is_extracting = False
+        self._last_auto_output_dir = None  # Track last auto-set output dir
         self.setup_ui()
         self.setup_connections()
         
@@ -386,8 +433,13 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
         self.archive_path_edit = QLineEdit()
         self.archive_path_edit.setPlaceholderText("Select an archive file to extract...")
         file_layout.addWidget(self.archive_path_edit, 0, 1)
+        
+        file_btns_layout = QHBoxLayout()
         self.browse_archive_btn = QPushButton("Browse...")
-        file_layout.addWidget(self.browse_archive_btn, 0, 2)
+        file_btns_layout.addWidget(self.browse_archive_btn)
+        self.bulk_extract_btn = QPushButton("Bulk Extract...")
+        file_btns_layout.addWidget(self.bulk_extract_btn)
+        file_layout.addLayout(file_btns_layout, 0, 2)
         
         file_layout.addWidget(QLabel("Output Directory:"), 1, 0)
         self.output_dir_edit = QLineEdit()
@@ -500,6 +552,7 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
     
     def setup_connections(self):
         self.browse_archive_btn.clicked.connect(self.browse_archive_file)
+        self.bulk_extract_btn.clicked.connect(self.bulk_extract_files)
         self.browse_output_btn.clicked.connect(self.browse_output_directory)
         self.extract_btn.clicked.connect(self.start_extraction)
         self.cancel_btn.clicked.connect(self.cancel_extraction)
@@ -530,11 +583,15 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
             self.output_dir_edit.setText(directory)
     
     def on_archive_path_changed(self, text):
-        if text and not self.output_dir_edit.text():
-            archive_path = Path(text)
-            if archive_path.exists():
-                default_output = archive_path.parent / archive_path.stem
-                self.output_dir_edit.setText(str(default_output))
+        archive_path = Path(text) if text else None
+        if not archive_path or not archive_path.exists():
+            return
+        default_output = str(archive_path.parent / archive_path.stem)
+        current_output = self.output_dir_edit.text()
+        # Update output dir if empty or matches last auto-set value
+        if not current_output or current_output == self._last_auto_output_dir:
+            self.output_dir_edit.setText(default_output)
+            self._last_auto_output_dir = default_output
     
     def validate_inputs(self) -> bool:
         archive_path = self.archive_path_edit.text()
@@ -557,8 +614,18 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
             QMessageBox.warning(self, "Warning", "Extraction is already in progress.")
             return
         
+        # Clean up any previous worker
+        if self.extraction_worker:
+            if self.extraction_worker.isRunning():
+                self.extraction_worker.terminate()
+                self.extraction_worker.wait()
+            self.extraction_worker.deleteLater()
+            self.extraction_worker = None
+        
         archive_path = Path(self.archive_path_edit.text())
         output_dir = Path(self.output_dir_edit.text()) if self.output_dir_edit.text() else None
+        # Update last auto output dir for next archive selection
+        self._last_auto_output_dir = str(archive_path.parent / archive_path.stem)
         log_level = self.log_level_combo.currentText()
         cleanup_zips = self.cleanup_checkbox.isChecked()
         show_stats = self.stats_checkbox.isChecked()
@@ -579,26 +646,42 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
         self.extraction_worker.error.connect(self.on_extraction_error)
         self.extraction_worker.log_message.connect(self.on_log_message)
         self.extraction_worker.start()
-    
+        
     def cancel_extraction(self):
-        if self.extraction_worker:
+        if self.extraction_worker and self.extraction_worker.isRunning():
             reply = QMessageBox.question(
                 self, "Cancel", "Cancel extraction?",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
             )
             if reply == QMessageBox.StandardButton.Yes:
                 self.extraction_worker.terminate()
+                self.extraction_worker.wait()  # Wait for the thread to finish
+                self.extraction_worker.deleteLater()
+                self.extraction_worker = None
                 self.finish_extraction()
                 self.log_message("⚠️ Extraction cancelled")
-    
+        
     def finish_extraction(self):
         self.is_extracting = False
         self.extract_btn.setEnabled(True)
         self.cancel_btn.setEnabled(False)
         self.progress_bar.setVisible(False)
         self.progress_label.setText("Ready")
+        
+        # Clean up the worker if it exists
+        if self.extraction_worker:
+            if self.extraction_worker.isRunning():
+                self.extraction_worker.terminate()
+                self.extraction_worker.wait()
+            self.extraction_worker.deleteLater()
+            self.extraction_worker = None
     
     def on_extraction_finished(self, success: bool, result_data: dict):
+        # First clean up the extraction worker
+        if self.extraction_worker:
+            self.extraction_worker.deleteLater()
+            self.extraction_worker = None
+            
         self.finish_extraction()
         
         if success:
@@ -622,6 +705,11 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
             QMessageBox.critical(self, "Failed", "❌ Extraction failed")
     
     def on_extraction_error(self, error_message: str):
+        # First clean up the extraction worker
+        if self.extraction_worker:
+            self.extraction_worker.deleteLater()
+            self.extraction_worker = None
+            
         self.finish_extraction()
         self.status_bar.showMessage("Extraction failed")
         QMessageBox.critical(self, "Error", f"❌ Error: {error_message}")
@@ -639,6 +727,74 @@ class RecursiveArchiveExtractorGUI(QMainWindow):
     def clear_logs(self):
         self.log_text.clear()
         self.status_bar.showMessage("Logs cleared")
+    
+    def bulk_extract_files(self):
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "Select Archive Files for Bulk Extraction",
+            "",
+            "Archive files (*.zip *.tar *.tar.gz *.tgz *.tar.bz2 *.tbz2 *.tar.xz *.txz *.gz);;All files (*.*)"
+        )
+        if not files:
+            return
+        if len(files) > 1:
+            msg = f"Extract {len(files)} archives? Each will be extracted to its own folder."
+        else:
+            msg = f"Extract selected archive?"
+        reply = QMessageBox.question(self, "Bulk Extraction", msg, QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        self.is_extracting = True
+        self.extract_btn.setEnabled(False)
+        self.bulk_extract_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setVisible(True)
+        self.progress_bar.setRange(0, len(files))
+        self.progress_bar.setValue(0)
+        self.progress_label.setText(f"Bulk extracting {len(files)} archives...")
+        self.status_bar.showMessage("Bulk extraction in progress...")
+        self.log_text.clear()
+        # Start bulk extraction in a QThread
+        self.bulk_worker = BulkExtractionWorker(
+            files,
+            self.log_level_combo.currentText(),
+            self.cleanup_checkbox.isChecked()
+        )
+        self.bulk_worker.log_message.connect(self.on_log_message)
+        self.bulk_worker.progress.connect(self.on_bulk_progress)
+        self.bulk_worker.finished.connect(self.on_bulk_finished)
+        self.bulk_worker.start()
+
+    def on_bulk_progress(self, current, total):
+        self.progress_bar.setRange(0, total)
+        self.progress_bar.setValue(current)
+        if current == total:
+            self.progress_label.setText("Bulk extraction complete")
+        else:
+            self.progress_label.setText(f"Bulk extracting... ({current}/{total})")
+
+    def on_bulk_finished(self, stats_list, files):
+        self.is_extracting = False
+        self.extract_btn.setEnabled(True)
+        self.bulk_extract_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.progress_bar.setVisible(False)
+        self.progress_label.setText("Ready")
+        self.status_bar.showMessage("Bulk extraction complete")
+        # Show summary
+        if stats_list:
+            summary = f"✅ Bulk extraction complete!\n\n"
+            for i, stats in enumerate(stats_list, 1):
+                summary += (f"[{i}] {files[i-1]}\n"
+                            f"• Total extractions: {stats['total_extractions']}\n"
+                            f"• Files processed: {stats['processed_files']}\n"
+                            f"• Archive size: {stats['total_archive_size_formatted']}\n"
+                            f"• Extracted size: {stats['total_extracted_size_formatted']}\n"
+                            f"• {stats['size_difference']}\n\n")
+            QMessageBox.information(self, "Bulk Extraction Complete", summary)
+        else:
+            QMessageBox.information(self, "Bulk Extraction", "No archives were extracted.")
+        self.bulk_worker = None
 
 
 def main():
