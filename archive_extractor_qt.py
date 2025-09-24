@@ -3,7 +3,7 @@
 Recursive Archive Extractor - PyQt6 GUI
 
 A single-file PyQt6 application for recursively extracting nested archive files.
-Supports ZIP, TAR, and GZIP formats.
+Supports ZIP, TAR, GZIP, XZ and LZMA formats.
 
 Author: GitHub Copilot
 Date: July 31, 2025
@@ -14,6 +14,7 @@ import os
 import zipfile
 import tarfile
 import gzip
+import lzma
 import shutil
 import logging
 import threading
@@ -43,7 +44,9 @@ class ArchiveExtractor:
         '.tbz2': 'tar',
         '.tar.xz': 'tar',
         '.txz': 'tar',
-        '.gz': 'gzip'
+        '.gz': 'gzip',
+        '.xz': 'xz',
+        '.lzma': 'lzma'
     }
     
     def __init__(self, log_level: str = 'INFO', cleanup_zips: bool = False):
@@ -119,6 +122,10 @@ class ArchiveExtractor:
                 with gzip.open(file_path, 'rb') as gz:
                     gz.read(1)
                     return True
+            elif archive_type in ('xz', 'lzma'):
+                with lzma.open(file_path, 'rb') as xz:
+                    xz.read(1)
+                    return True
         except Exception:
             return False
         return False
@@ -149,6 +156,12 @@ class ArchiveExtractor:
                     with open(output_file, 'wb') as f_out:
                         shutil.copyfileobj(gz_in, f_out)
                 self.logger.info(f"Extracted gzip file to: {output_file}")
+            elif archive_type in ('xz', 'lzma'):
+                output_file = extract_to / archive_path.stem
+                with lzma.open(archive_path, 'rb') as xz_in:
+                    with open(output_file, 'wb') as f_out:
+                        shutil.copyfileobj(xz_in, f_out)
+                self.logger.info(f"Extracted {archive_type} file to: {output_file}")
             else:
                 self.logger.error(f"Unsupported archive type for {archive_path}")
                 return False
